@@ -14,23 +14,34 @@ internal sealed record RelationalColumn(
 {
     public string Name => Property.Name;
 
+    // Complex properties containing this column, ordered root to leaf.
+    // With Parent -> Child -> SubChild you need to check Parent first, then Child, then SubChild.
+    // Computed once at construction (columns are cached per table), and immutable so record equality stays stable.
+    private readonly IComplexProperty[] _complexChain = GetComplexChain(Property);
+
+    private static IComplexProperty[] GetComplexChain(IProperty property)
+    {
+        if (property.DeclaringType is not IComplexType)
+            return [];
+
+        var chain = new List<IComplexProperty>();
+        for (var declaringType = property.DeclaringType; declaringType is IComplexType complexType; declaringType = complexType.ComplexProperty.DeclaringType)
+        {
+            chain.Add(complexType.ComplexProperty);
+        }
+        chain.Reverse();
+        return [.. chain];
+    }
+
+    // EF's getter silently returns CLR defaults (e.g. 0) for value types behind a null complex property,
+    // so we need to walk the chain ourselves to tell "null parent" apart from "zero value".
     private bool IsNull([NotNullWhen(false)] object? entity)
     {
         if (entity == null) return true;
 
-        var complexProperties = new Stack<IComplexProperty>();
-
-        // Need to collect root to leaf.
-        // With Parent -> Child -> SubChild you need to check Parent first, then Child, then SubChild.
-        for (var declaringType = Property.DeclaringType; declaringType is IComplexType complexType; declaringType = complexType.ComplexProperty.DeclaringType)
-        {
-            complexProperties.Push(complexType.ComplexProperty);
-        }
-
-        while (complexProperties.TryPop(out var complexProperty))
+        foreach (var complexProperty in _complexChain)
         {
             entity = complexProperty.GetGetter().GetClrValue(entity);
-
             if (entity == null)
                 return true;
         }
@@ -48,20 +59,24 @@ internal sealed record RelationalColumn(
             obj = EntityGetter(entity);
         }
 
-        bool isAbsent = IsNull(obj);
-        var rawValue = isAbsent ? null
-            : Property.GetGetter().GetClrValueUsingContainingEntity(obj!);
-
         string? defaultSql = null;
-        var hasDefaultValue = Property.TryGetUsableDefaultValue(out var defaultValue);
-        var defaultValueSql = Property.GetDefaultValueSql();
-        var hasConfiguredDefault = hasDefaultValue || defaultValueSql != null;
-        if (rawValue == null || (hasConfiguredDefault && Property.IsSentinel(rawValue)))
+        object? rawValue = null;
+
+        // A null owner / complex property means the column is NULL - configured defaults don't apply
+        if (!IsNull(obj))
         {
-            if (hasDefaultValue && !isAbsent)
-                rawValue = defaultValue;
-            else
-                defaultSql = defaultValueSql;
+            rawValue = Property.GetGetter().GetClrValueUsingContainingEntity(obj);
+            var hasDefaultValue = Property.TryGetUsableDefaultValue(out var defaultValue);
+            var defaultValueSql = Property.GetDefaultValueSql();
+
+            var hasConfiguredDefault = hasDefaultValue || defaultValueSql != null;
+            if (rawValue == null || (hasConfiguredDefault && Property.IsSentinel(rawValue)))
+            {
+                if (hasDefaultValue)
+                    rawValue = defaultValue;
+                else
+                    defaultSql = defaultValueSql;
+            }
         }
 
         var value = new ConstantValue(rawValue, this);
