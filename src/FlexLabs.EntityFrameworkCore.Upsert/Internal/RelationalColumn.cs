@@ -1,4 +1,6 @@
+using System.Collections.Immutable;
 using System.Diagnostics.CodeAnalysis;
+using System.Runtime.InteropServices;
 using FlexLabs.EntityFrameworkCore.Upsert.Internal.Expressions;
 using Microsoft.EntityFrameworkCore.Metadata;
 
@@ -16,21 +18,27 @@ internal sealed record RelationalColumn(
 
     // Complex properties containing this column, ordered root to leaf.
     // With Parent -> Child -> SubChild you need to check Parent first, then Child, then SubChild.
-    // Computed once at construction (columns are cached per table), and immutable so record equality stays stable.
-    private readonly IComplexProperty[] _complexChain = GetComplexChain(Property);
+    // Computed once at construction (columns are cached per table).
+    // Caveats: record equality includes this field and ImmutableArray compares by reference, so separately built
+    // columns never compare equal; and `with` copies it as-is, so a `with { Property = ... }` copy keeps a stale chain.
+    private readonly ImmutableArray<IComplexProperty> _complexChain = GetComplexChain(Property);
 
-    private static IComplexProperty[] GetComplexChain(IProperty property)
+    private static ImmutableArray<IComplexProperty> GetComplexChain(IProperty property)
     {
-        if (property.DeclaringType is not IComplexType)
+        // Walk the chain twice (count, then fill from the end) to allocate a single exact-size array.
+        // The metadata walk is a few field reads, which is much cheaper than a temporary list.
+        var depth = 0;
+        for (var declaringType = property.DeclaringType; declaringType is IComplexType complexType; declaringType = complexType.ComplexProperty.DeclaringType)
+            depth++;
+
+        if (depth == 0)
             return [];
 
-        var chain = new List<IComplexProperty>();
+        var chain = new IComplexProperty[depth];
         for (var declaringType = property.DeclaringType; declaringType is IComplexType complexType; declaringType = complexType.ComplexProperty.DeclaringType)
-        {
-            chain.Add(complexType.ComplexProperty);
-        }
-        chain.Reverse();
-        return [.. chain];
+            chain[--depth] = complexType.ComplexProperty;
+
+        return ImmutableCollectionsMarshal.AsImmutableArray(chain);
     }
 
     // EF's getter silently returns CLR defaults (e.g. 0) for value types behind a null complex property,
